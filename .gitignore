@@ -1,0 +1,24 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environment
+.venv/
+venv/
+ENV/
+env/
+
+# IDE
+.spyproject/
+.vscode/
+.idea/
+
+# Output plots (ignore all except README)
+output_plots/*
+!output_plots/README.md
+
+# Pickle files (large data files)
+*.pickle
