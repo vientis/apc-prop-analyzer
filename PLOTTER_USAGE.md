@@ -6,10 +6,14 @@ python char_plotter.py
 ```
 This will start the interactive interface where you can:
 1. Select from available propellers
-2. Enter a flight speed (0-100 m/s)
-3. View the characteristic plots
+2. Choose plot type:
+   - **RPM Sweep**: Thrust/Torque/Power vs RPM at specific flight speed
+   - **J Sweep**: CT/CP/Efficiency vs Advance Ratio (J) at specific RPM
+3. Enter parameters based on plot type
+4. Optionally add reference markers
+5. View or save the characteristic plots
 
-## Example 2: Programmatic Usage
+## Example 2: Programmatic Usage - RPM Sweep
 ```python
 from char_plotter import load_propeller_data, plot_characteristics, find_available_propellers
 
@@ -35,7 +39,26 @@ plot_characteristics(data, flight_speed, propeller_name,
                    reference_rpms=reference_rpms)
 ```
 
-## Example 3: Batch Processing
+## Example 3: Programmatic Usage - J Sweep (New Feature)
+```python
+from char_plotter import load_propeller_data, plot_j_sweep
+
+# Load data for a specific propeller
+propeller_name = "D10P12B2TWE"
+data = load_propeller_data(propeller_name)
+
+# Plot CT, CP, and Efficiency vs J at a specific RPM
+target_rpm = 10000  # RPM
+plot_j_sweep(data, target_rpm, propeller_name)
+
+# Save plot with reference J values
+reference_j_values = [0.3, 0.5, 0.7]
+plot_j_sweep(data, target_rpm, propeller_name, 
+            save_plot=True, 
+            reference_j_values=reference_j_values)
+```
+
+## Example 4: Batch Processing
 ```python
 import matplotlib.pyplot as plt
 from char_plotter import load_propeller_data, plot_characteristics, find_available_propellers
@@ -82,31 +105,45 @@ The plotter uses second-order polynomial fitting for thrust, torque, and power c
 
 ## Features
 
+### Plot Types
+1. **RPM Sweep Plots** (Thrust/Torque/Power vs RPM at specific flight speed)
+   - Three comprehensive plots: Thrust vs RPM, Torque vs RPM, Shaft Power vs RPM
+   - Second-order polynomial curve fitting for mathematical relationships
+   - Physical RPM limiting using APC's 190,000/diameter rule
+   - Truncated zero exclusion for accurate fitting
+   - Optional reference RPM markers with interpolated values
+
+2. **J Sweep Plots** (CT/CP/Efficiency vs Advance Ratio at specific RPM) - NEW!
+   - Three comprehensive plots: CT vs J, CP vs J, Efficiency vs J
+   - Shows performance across flight speed range at constant RPM
+   - Optional reference J value markers with interpolated coefficients
+   - Ideal for analyzing propeller efficiency characteristics
+
+### General Features
 - **Interactive propeller selection**: Choose from available propellers or enter name directly
-- **Automatic speed matching**: Finds closest available flight speed if exact match not found
-- **Three comprehensive plots**:
-  - Thrust vs RPM
-  - Torque vs RPM  
-  - Shaft Power vs RPM
-- **Second-order polynomial curve fitting**: Shows mathematical relationship between variables
-- **Physical RPM limiting**: Excludes high-RPM extrapolated data points from curve fits using APC's 190,000/diameter rule
-- **Truncated zero exclusion**: Starts curve fitting from first positive thrust value to exclude artificially truncated negative thrust values
-- **Reference RPM markers**: Optional vertical lines with interpolated values from trendlines at user-specified RPMs
-  - Only shows markers within the fitted RPM range (between first positive thrust and max mechanical RPM)
-  - Displays interpolated thrust (N), torque (Nm), and power (W) values from the polynomial fits
-  - Intelligent label positioning prevents overlap when reference RPMs are close together
+- **Automatic value matching**: Finds closest available speed/RPM if exact match not found
+- **Reference markers**: Optional vertical lines with interpolated values from trendlines
+  - Intelligent label positioning prevents overlap when reference values are close together
+  - Displays interpolated values at user-specified points
 - **Save functionality**: Option to save plots as high-resolution PNG files
   - Default output directory: `output_plots/` (automatically created)
   - Custom output directories can be specified programmatically
+- **Class-based architecture**: Easy to extend with new plot types in the future
 
 ## Interactive Usage
 
 When you run the script interactively, it will:
 
 1. **Display available propellers** - Shows all propellers with data files
-2. **Propeller selection** - Choose by number or enter name directly  
-3. **Flight speed input** - Enter desired speed (0-100 m/s)
-4. **Speed matching** - Automatically finds closest available speed if needed
-5. **Reference RPM input** - Optionally specify RPMs to mark on graphs (comma-separated)
+2. **Propeller selection** - Choose by number or enter name directly
+3. **Plot type selection** - Choose between:
+   - RPM Sweep (Thrust/Torque/Power vs RPM)
+   - J Sweep (CT/CP/Efficiency vs J)
+4. **Parameter input** - Based on plot type:
+   - RPM Sweep: Enter flight speed (0-100 m/s)
+   - J Sweep: Enter target RPM
+5. **Reference markers** - Optionally specify reference values to mark on graphs
+   - RPM Sweep: Enter reference RPMs (comma-separated)
+   - J Sweep: Enter reference J values (comma-separated)
 6. **Plot saving option** - Choose whether to save plots to files
-7. **Generate plots** - Creates three plots with curve fits, reference markers, and saves/displays them
+7. **Generate plots** - Creates three plots with reference markers and saves/displays them
