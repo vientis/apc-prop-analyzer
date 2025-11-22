@@ -104,6 +104,11 @@ class PlotUtilities:
         return a * x**2 + b * x + c
     
     @staticmethod
+    def third_order_polynomial(x, a, b, c, d):
+        """Third order polynomial function for curve fitting."""
+        return a * x**3 + b * x**2 + c * x + d
+    
+    @staticmethod
     def calculate_label_offsets(valid_refs, ref_range):
         """Calculate vertical offsets for reference markers to prevent overlap."""
         if len(valid_refs) <= 1:
@@ -194,31 +199,109 @@ class RPMSweepPlotter(BasePlotter):
         torque = speed_data['Q'].values
         power = speed_data['P'].values
         
-        if self.max_mechanical_rpm:
+        # TODO: TEMPORARY FIX - Remove this once input data is cleaned up
+        # Reduce max RPM by 1000 to avoid anomalies in high-RPM data for 10 inch props
+        effective_max_rpm = self.max_mechanical_rpm - 1000 if self.max_mechanical_rpm else None
+        
+        if effective_max_rpm:
             print(f"Propeller diameter: {self.diameter_inches} inches")
-            print(f"Max mechanical RPM limit for curve fitting: {self.max_mechanical_rpm} RPM")
+            print(f"Max mechanical RPM limit for curve fitting: {effective_max_rpm} RPM (reduced by 1000 due to data anomalies)")
         
-        # Find first positive thrust for fitting
-        positive_thrust_indices = np.where((rpm > 0) & (thrust > 0))[0]
+        # Find first meaningful positive thrust for fitting
+        # Need to handle non-monotonic data in the transition region
+        thrust_threshold = 0.1  # Newtons - threshold for meaningful thrust
         
-        if len(positive_thrust_indices) > 0:
-            first_positive_idx = positive_thrust_indices[0]
-            first_positive_rpm = rpm[first_positive_idx]
-            print(f"First positive thrust at RPM: {first_positive_rpm} (index {first_positive_idx})")
+        # Find candidates that exceed threshold
+        significant_thrust_indices = np.where((rpm > 0) & (thrust > thrust_threshold))[0]
+        
+        if len(significant_thrust_indices) > 0:
+            # Check for consistently increasing thrust after each candidate
+            # This handles cases where thrust has spurious high values followed by drops
+            first_positive_idx = None
             
-            truncated_zeros = np.sum((rpm > 0) & (rpm < first_positive_rpm) & (thrust == 0))
-            if truncated_zeros > 0:
-                print(f"Excluding {truncated_zeros} truncated zero values (RPM 1000-{first_positive_rpm-1000:.0f})")
+            for candidate_idx in significant_thrust_indices:
+                # Look ahead at next 2 points to verify thrust is consistently above threshold
+                look_ahead = min(2, len(thrust) - candidate_idx - 1)
+                
+                if look_ahead >= 2:
+                    # Check the next 2 consecutive points
+                    next_1 = thrust[candidate_idx + 1]
+                    next_2 = thrust[candidate_idx + 2]
+                    
+                    # All three consecutive points (current + next 2) must be above threshold
+                    if next_1 > thrust_threshold and next_2 > thrust_threshold:
+                        first_positive_idx = candidate_idx
+                        break
+                elif look_ahead == 1:
+                    # Near end, check if next point is also above threshold
+                    next_1 = thrust[candidate_idx + 1]
+                    if next_1 > thrust_threshold:
+                        first_positive_idx = candidate_idx
+                        break
+                else:
+                    # At the very end, just use it
+                    first_positive_idx = candidate_idx
+                    break
             
-            if self.max_mechanical_rpm:
-                fitting_mask = (rpm >= first_positive_rpm) & (rpm <= self.max_mechanical_rpm)
-                print(f"Fitting data from {first_positive_rpm} RPM to {self.max_mechanical_rpm} RPM")
+            # If no consistent region found, use fallback strategies
+            if first_positive_idx is None and len(significant_thrust_indices) > 0:
+                # Try using a point where subsequent values are all positive (not necessarily above threshold)
+                for candidate_idx in significant_thrust_indices:
+                    if candidate_idx < len(thrust) - 2:
+                        # Check if next 2 points have positive thrust
+                        if thrust[candidate_idx + 1] > 0 and thrust[candidate_idx + 2] > 0:
+                            first_positive_idx = candidate_idx
+                            break
+                
+                # Last resort: use the point with most remaining above-threshold values
+                if first_positive_idx is None:
+                    best_candidate = None
+                    best_score = 0
+                    for candidate_idx in significant_thrust_indices:
+                        remaining_above = np.sum(thrust[candidate_idx:] > thrust_threshold)
+                        if remaining_above > best_score:
+                            best_score = remaining_above
+                            best_candidate = candidate_idx
+                    first_positive_idx = best_candidate
+            
+            if first_positive_idx is not None:
+                first_positive_rpm = rpm[first_positive_idx]
+                print(f"First reliable positive thrust (>{thrust_threshold}N) at RPM: {first_positive_rpm} (index {first_positive_idx})")
+                
+                # Count excluded points
+                excluded_points = np.sum((rpm > 0) & (rpm < first_positive_rpm))
+                if excluded_points > 0:
+                    print(f"Excluding {excluded_points} data points with zero/negative/unreliable thrust (RPM 1000-{first_positive_rpm-1000:.0f})")
+                
+                if effective_max_rpm:
+                    fitting_mask = (rpm >= first_positive_rpm) & (rpm <= effective_max_rpm)
+                    print(f"Fitting data from {first_positive_rpm} RPM to {effective_max_rpm} RPM")
+                else:
+                    fitting_mask = rpm >= first_positive_rpm
+                    print("Warning: Could not determine propeller diameter. Using data from first positive thrust onward.")
+                
+                # For plotting purposes, use indices from first_positive_idx onward
+                positive_thrust_indices = np.where((rpm >= first_positive_rpm) & (thrust > 0))[0]
             else:
-                fitting_mask = rpm >= first_positive_rpm
-                print("Warning: Could not determine propeller diameter. Using data from first positive thrust onward.")
+                # Fallback
+                positive_thrust_indices = np.where((rpm > 0) & (thrust > 0))[0]
+                fitting_mask = rpm > 0
+                print("Warning: Could not find reliable thrust region. Using all positive data.")
         else:
-            fitting_mask = rpm > 0
-            print("Warning: No positive thrust values found. Using all non-zero RPM data for fitting.")
+            # Fallback: try lower threshold or use all positive thrust
+            positive_thrust_indices = np.where((rpm > 0) & (thrust > 0))[0]
+            if len(positive_thrust_indices) > 0:
+                first_positive_idx = positive_thrust_indices[0]
+                first_positive_rpm = rpm[first_positive_idx]
+                print(f"Note: Using lower threshold - First positive thrust at RPM: {first_positive_rpm}")
+                if effective_max_rpm:
+                    fitting_mask = (rpm >= first_positive_rpm) & (rpm <= effective_max_rpm)
+                else:
+                    fitting_mask = rpm >= first_positive_rpm
+            else:
+                positive_thrust_indices = np.array([], dtype=int)
+                fitting_mask = rpm > 0
+                print("Warning: No positive thrust values found. Using all non-zero RPM data for fitting.")
         
         rpm_fit = rpm[fitting_mask]
         thrust_fit = thrust[fitting_mask]
@@ -235,23 +318,23 @@ class RPMSweepPlotter(BasePlotter):
                      fontsize=14, fontweight='bold')
         
         # Plot thrust, torque, and power
-        popt_thrust = self._plot_thrust(ax1, rpm, thrust, rpm_fit, thrust_fit, positive_thrust_indices, reference_rpms)
-        popt_torque = self._plot_torque(ax2, rpm, torque, rpm_fit, torque_fit, positive_thrust_indices, reference_rpms)
-        popt_power = self._plot_power(ax3, rpm, power, rpm_fit, power_fit, positive_thrust_indices, reference_rpms)
+        popt_thrust = self._plot_thrust(ax1, rpm, thrust, rpm_fit, thrust_fit, positive_thrust_indices, reference_rpms, effective_max_rpm)
+        popt_torque = self._plot_torque(ax2, rpm, torque, rpm_fit, torque_fit, positive_thrust_indices, reference_rpms, effective_max_rpm)
+        popt_power = self._plot_power(ax3, rpm, power, rpm_fit, power_fit, positive_thrust_indices, reference_rpms, effective_max_rpm)
         
         plt.tight_layout()
         self.save_or_show_plot(fig, save_plot, output_dir)
     
-    def _plot_thrust(self, ax, rpm, thrust, rpm_fit, thrust_fit, positive_thrust_indices, reference_rpms):
+    def _plot_thrust(self, ax, rpm, thrust, rpm_fit, thrust_fit, positive_thrust_indices, reference_rpms, effective_max_rpm):
         """Plot Thrust vs RPM."""
         zero_rpm_mask = rpm == 0
         
         if len(positive_thrust_indices) > 0:
             first_positive_rpm = rpm[positive_thrust_indices[0]]
             fitted_data_mask = (rpm >= first_positive_rpm)
-            if self.max_mechanical_rpm:
-                fitted_data_mask = fitted_data_mask & (rpm <= self.max_mechanical_rpm)
-                extrapolated_mask = rpm > self.max_mechanical_rpm
+            if effective_max_rpm:
+                fitted_data_mask = fitted_data_mask & (rpm <= effective_max_rpm)
+                extrapolated_mask = rpm > effective_max_rpm
             else:
                 extrapolated_mask = np.zeros_like(rpm, dtype=bool)
             
@@ -259,16 +342,16 @@ class RPMSweepPlotter(BasePlotter):
             display_fitted_mask = fitted_data_mask & (~truncated_mask) & (~zero_rpm_mask)
             
             if np.any(display_fitted_mask):
-                if self.max_mechanical_rpm:
+                if effective_max_rpm:
                     ax.scatter(rpm[display_fitted_mask], thrust[display_fitted_mask], alpha=0.8, color='blue', s=30,
-                             label=f'Fitted data ({first_positive_rpm:.0f}-{self.max_mechanical_rpm} RPM)')
+                             label=f'Fitted data ({first_positive_rpm:.0f}-{effective_max_rpm} RPM)')
                 else:
                     ax.scatter(rpm[display_fitted_mask], thrust[display_fitted_mask], alpha=0.8, color='blue', s=30,
                              label=f'Fitted data (≥{first_positive_rpm:.0f} RPM)')
             
-            if self.max_mechanical_rpm and np.any(extrapolated_mask):
+            if effective_max_rpm and np.any(extrapolated_mask):
                 ax.scatter(rpm[extrapolated_mask], thrust[extrapolated_mask], alpha=0.5, color='lightblue', s=30,
-                         label=f'Extrapolated data (>{self.max_mechanical_rpm} RPM)')
+                         label=f'Extrapolated data (>{effective_max_rpm} RPM)')
         else:
             non_zero_mask = rpm > 0
             if np.any(non_zero_mask):
@@ -277,7 +360,7 @@ class RPMSweepPlotter(BasePlotter):
         
         popt_thrust = None
         try:
-            if len(rpm_fit) > 3:
+            if len(rpm_fit) >= 3:
                 popt_thrust, _ = curve_fit(PlotUtilities.second_order_polynomial, rpm_fit, thrust_fit)
                 rpm_smooth = np.linspace(rpm_fit.min(), rpm_fit.max(), 200)
                 thrust_smooth = PlotUtilities.second_order_polynomial(rpm_smooth, *popt_thrust)
@@ -306,16 +389,16 @@ class RPMSweepPlotter(BasePlotter):
         
         return popt_thrust
     
-    def _plot_torque(self, ax, rpm, torque, rpm_fit, torque_fit, positive_thrust_indices, reference_rpms):
+    def _plot_torque(self, ax, rpm, torque, rpm_fit, torque_fit, positive_thrust_indices, reference_rpms, effective_max_rpm):
         """Plot Torque vs RPM."""
         zero_rpm_mask = rpm == 0
         
         if len(positive_thrust_indices) > 0:
             first_positive_rpm = rpm[positive_thrust_indices[0]]
             fitted_data_mask = (rpm >= first_positive_rpm)
-            if self.max_mechanical_rpm:
-                fitted_data_mask = fitted_data_mask & (rpm <= self.max_mechanical_rpm)
-                extrapolated_mask = rpm > self.max_mechanical_rpm
+            if effective_max_rpm:
+                fitted_data_mask = fitted_data_mask & (rpm <= effective_max_rpm)
+                extrapolated_mask = rpm > effective_max_rpm
             else:
                 extrapolated_mask = np.zeros_like(rpm, dtype=bool)
             
@@ -324,16 +407,16 @@ class RPMSweepPlotter(BasePlotter):
             display_fitted_mask = fitted_data_mask & (~truncated_mask) & (~zero_rpm_mask)
             
             if np.any(display_fitted_mask):
-                if self.max_mechanical_rpm:
+                if effective_max_rpm:
                     ax.scatter(rpm[display_fitted_mask], torque[display_fitted_mask], alpha=0.8, color='green', s=30,
-                             label=f'Fitted data ({first_positive_rpm:.0f}-{self.max_mechanical_rpm} RPM)')
+                             label=f'Fitted data ({first_positive_rpm:.0f}-{effective_max_rpm} RPM)')
                 else:
                     ax.scatter(rpm[display_fitted_mask], torque[display_fitted_mask], alpha=0.8, color='green', s=30,
                              label=f'Fitted data (≥{first_positive_rpm:.0f} RPM)')
             
-            if self.max_mechanical_rpm and np.any(extrapolated_mask):
+            if effective_max_rpm and np.any(extrapolated_mask):
                 ax.scatter(rpm[extrapolated_mask], torque[extrapolated_mask], alpha=0.5, color='lightgreen', s=30,
-                         label=f'Extrapolated data (>{self.max_mechanical_rpm} RPM)')
+                         label=f'Extrapolated data (>{effective_max_rpm} RPM)')
         else:
             non_zero_mask = rpm > 0
             if np.any(non_zero_mask):
@@ -342,7 +425,7 @@ class RPMSweepPlotter(BasePlotter):
         
         popt_torque = None
         try:
-            if len(rpm_fit) > 3:
+            if len(rpm_fit) >= 3:
                 popt_torque, _ = curve_fit(PlotUtilities.second_order_polynomial, rpm_fit, torque_fit)
                 rpm_smooth = np.linspace(rpm_fit.min(), rpm_fit.max(), 200)
                 torque_smooth = PlotUtilities.second_order_polynomial(rpm_smooth, *popt_torque)
@@ -371,16 +454,16 @@ class RPMSweepPlotter(BasePlotter):
         
         return popt_torque
     
-    def _plot_power(self, ax, rpm, power, rpm_fit, power_fit, positive_thrust_indices, reference_rpms):
+    def _plot_power(self, ax, rpm, power, rpm_fit, power_fit, positive_thrust_indices, reference_rpms, effective_max_rpm):
         """Plot Power vs RPM."""
         zero_rpm_mask = rpm == 0
         
         if len(positive_thrust_indices) > 0:
             first_positive_rpm = rpm[positive_thrust_indices[0]]
             fitted_data_mask = (rpm >= first_positive_rpm)
-            if self.max_mechanical_rpm:
-                fitted_data_mask = fitted_data_mask & (rpm <= self.max_mechanical_rpm)
-                extrapolated_mask = rpm > self.max_mechanical_rpm
+            if effective_max_rpm:
+                fitted_data_mask = fitted_data_mask & (rpm <= effective_max_rpm)
+                extrapolated_mask = rpm > effective_max_rpm
             else:
                 extrapolated_mask = np.zeros_like(rpm, dtype=bool)
             
@@ -389,16 +472,16 @@ class RPMSweepPlotter(BasePlotter):
             display_fitted_mask = fitted_data_mask & (~truncated_mask) & (~zero_rpm_mask)
             
             if np.any(display_fitted_mask):
-                if self.max_mechanical_rpm:
+                if effective_max_rpm:
                     ax.scatter(rpm[display_fitted_mask], power[display_fitted_mask], alpha=0.8, color='orange', s=30,
-                             label=f'Fitted data ({first_positive_rpm:.0f}-{self.max_mechanical_rpm} RPM)')
+                             label=f'Fitted data ({first_positive_rpm:.0f}-{effective_max_rpm} RPM)')
                 else:
                     ax.scatter(rpm[display_fitted_mask], power[display_fitted_mask], alpha=0.8, color='orange', s=30,
                              label=f'Fitted data (≥{first_positive_rpm:.0f} RPM)')
             
-            if self.max_mechanical_rpm and np.any(extrapolated_mask):
+            if effective_max_rpm and np.any(extrapolated_mask):
                 ax.scatter(rpm[extrapolated_mask], power[extrapolated_mask], alpha=0.5, color='moccasin', s=30,
-                         label=f'Extrapolated data (>{self.max_mechanical_rpm} RPM)')
+                         label=f'Extrapolated data (>{effective_max_rpm} RPM)')
         else:
             non_zero_mask = rpm > 0
             if np.any(non_zero_mask):
@@ -407,12 +490,12 @@ class RPMSweepPlotter(BasePlotter):
         
         popt_power = None
         try:
-            if len(rpm_fit) > 3:
-                popt_power, _ = curve_fit(PlotUtilities.second_order_polynomial, rpm_fit, power_fit)
+            if len(rpm_fit) >= 4:
+                popt_power, _ = curve_fit(PlotUtilities.third_order_polynomial, rpm_fit, power_fit)
                 rpm_smooth = np.linspace(rpm_fit.min(), rpm_fit.max(), 200)
-                power_smooth = PlotUtilities.second_order_polynomial(rpm_smooth, *popt_power)
+                power_smooth = PlotUtilities.third_order_polynomial(rpm_smooth, *popt_power)
                 ax.plot(rpm_smooth, power_smooth, 'r-', linewidth=2,
-                       label=f'2nd Order Fit: P = {popt_power[0]:.2e}×RPM² + {popt_power[1]:.2e}×RPM + {popt_power[2]:.2f}')
+                       label=f'3rd Order Fit: P = {popt_power[0]:.2e}×RPM³ + {popt_power[1]:.2e}×RPM² + {popt_power[2]:.2e}×RPM + {popt_power[3]:.2f}')
         except Exception as e:
             print(f"Could not fit power curve: {e}")
         
@@ -421,7 +504,7 @@ class RPMSweepPlotter(BasePlotter):
             label_offsets = PlotUtilities.calculate_label_offsets(valid_rpms, (rpm_fit.min(), rpm_fit.max()))
             
             for ref_rpm, y_offset in label_offsets:
-                power_value = PlotUtilities.second_order_polynomial(ref_rpm, *popt_power)
+                power_value = PlotUtilities.third_order_polynomial(ref_rpm, *popt_power)
                 ax.axvline(x=ref_rpm, color='purple', linestyle='--', alpha=0.7)
                 ax.annotate(f'P = {power_value:.0f}W @ {ref_rpm:.0f} RPM', 
                           xy=(ref_rpm, power_value), xytext=(10, y_offset), 
