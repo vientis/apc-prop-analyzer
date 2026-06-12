@@ -15,14 +15,114 @@ import pickle
 from pathlib import Path
 
 
-def generate_propeller_characteristics(data_folder, verbose=False):
+def extrapolate_below_zero(propeller_data, propeller_diameter, n_anchor=4):
+    """
+    Supplement the zero-truncated (windmilling) region of each airspeed DataFrame
+    with a physically-grounded negative thrust/torque extrapolation.
+
+    The APC source data is truncated at the zero-thrust point, so any (airspeed, rpm)
+    combination where the rpm is too low to produce forward thrust is filled with 0 by
+    the generator. Physically the prop windmills there and produces negative thrust
+    (drag) and reduced torque that continue smoothly below zero.
+
+    Method - tangent continuation of the measured trend:
+        For a fixed airspeed V, thrust and torque vs RPM are continued below the lowest
+        measured RPM by extending the local trend of the nearest measured points. The
+        line is anchored exactly at the last real (lowest-RPM) data point and uses the
+        slope of the nearest ``n_anchor`` measured points, so the extrapolation is
+        continuous in both value and slope at the hand-off (no kink) and monotonic by
+        construction. Thrust and torque therefore keep decreasing through the
+        windmilling regime - thrust passing into drag and torque heading toward the
+        autorotation (zero-torque) crossing - rather than turning back up.
+
+        A global quadratic was deliberately avoided: because the measured torque curve
+        bottoms out right at the zero-thrust boundary, a parabola fit to it turns back
+        *up* when extrapolated, which is non-physical and produces a visible kink where
+        the extrapolated and measured data meet.
+
+    Args:
+        propeller_data: Dictionary {V: DataFrame} produced by the generator
+        propeller_diameter: Propeller diameter in metres
+        n_anchor: Number of lowest-RPM measured points used to estimate the local slope
+
+    Returns:
+        The same dictionary, with truncated cells replaced by extrapolated values and a
+        new boolean column 'extrapolated' marking the supplemented rows.
+    """
+    rho = 1.225  # Air density in kg/m^3 at sea level (matches generator)
+    D = propeller_diameter
+
+    for v in range(101):
+        df = propeller_data[v]  # already sorted ascending by rpm with a clean index
+        if 'extrapolated' not in df.columns:
+            df['extrapolated'] = False
+
+        # Static case: J = 0 for every rpm, so there is no truncated region to fill.
+        if v == 0:
+            continue
+
+        # The truncated (zero-filled) cells form a block at the low-RPM / high-J end; the
+        # measured data is a block at the high-RPM end. The hand-off is the highest-RPM
+        # zero cell: everything at or below it is extrapolated (this also absorbs any
+        # stray/ragged points the source leaves below the truncation edge), and the clean
+        # contiguous measured block above it provides the anchor and local slope.
+        thrust = df['T'].values
+        zero_pos = np.where(thrust == 0)[0]  # includes the rpm=0 row
+        if len(zero_pos) == 0:
+            continue
+        z = int(zero_pos.max())
+
+        # Need at least 2 measured points above the hand-off to estimate a slope.
+        measured = df.iloc[z + 1:]
+        if len(measured) < 2:
+            continue
+
+        # Anchor at the lowest measured RPM of the clean block and take the local slope
+        # from its nearest points. Slopes are clamped non-negative so the continuation is
+        # always monotonically decreasing toward lower RPM (no kink, no upturn).
+        boundary = measured.iloc[0]
+        rpm_b, T_b, Q_b = boundary['rpm'], boundary['T'], boundary['Q']
+        local = measured.iloc[:n_anchor]
+        slope_T = max(np.polyfit(local['rpm'], local['T'], 1)[0], 0.0)
+        slope_Q = max(np.polyfit(local['rpm'], local['Q'], 1)[0], 0.0)
+
+        for pos in range(z + 1):
+            idx = df.index[pos]
+            rpm = df.at[idx, 'rpm']
+            n = rpm / 60.0  # rev/s
+
+            # Tangent line from the boundary; min() guards against ever rising back above
+            # the measured boundary value at lower RPM.
+            T_ex = min(float(T_b + slope_T * (rpm - rpm_b)), float(T_b))
+            Q_ex = min(float(Q_b + slope_Q * (rpm - rpm_b)), float(Q_b))
+
+            df.at[idx, 'T'] = T_ex
+            df.at[idx, 'Q'] = Q_ex
+            df.at[idx, 'P'] = 2 * np.pi * n * Q_ex  # keep P = 2*pi*n*Q invariant
+
+            # Dimensionless coefficients are undefined at n=0 (division by zero); leave
+            # them at their existing 0 there, matching the generator's np.where guard.
+            if n > 0:
+                df.at[idx, 'CT'] = T_ex / (rho * n**2 * D**4)
+                df.at[idx, 'CP'] = df.at[idx, 'P'] / (rho * n**3 * D**5)
+                df.at[idx, 'CQ'] = df.at[idx, 'CP'] / (2 * np.pi)
+                df.at[idx, 'eta'] = (T_ex * v) / df.at[idx, 'P'] if df.at[idx, 'P'] != 0 else 0
+
+            df.at[idx, 'extrapolated'] = True
+
+    return propeller_data
+
+
+def generate_propeller_characteristics(data_folder, verbose=False, extrapolate=True):
     """
     Generate characteristic data for a single propeller.
-    
+
     Args:
         data_folder: Path to the propeller performance data folder
         verbose: Print progress information
-        
+        extrapolate: Supplement the zero-truncated region with a physically-grounded
+            negative thrust/torque extrapolation (see extrapolate_below_zero)
+
     Returns:
         tuple: (propeller_data dict, folder_name) or (None, None) if failed
     """
@@ -72,7 +172,7 @@ def generate_propeller_characteristics(data_folder, verbose=False):
             
             # Interpolate physical quantities with appropriate polynomial orders
             # Thrust (T), Torque (Q) scale with RPM^2 -> use quadratic interpolation
-            # Power (P) scales with RPM^3 -> use cubic interpolation
+            # Power (P) MUST be derived from Q to maintain P = 2πnQ relationship
             # V doesn't need interpolation (it's the merge key)
             
             # Use quadratic interpolation for thrust and torque (order=2)
@@ -80,19 +180,20 @@ def generate_propeller_characteristics(data_folder, verbose=False):
                 if col in data.columns:
                     data[col].interpolate(method='polynomial', order=2, inplace=True)
             
-            # Use cubic interpolation for power (order=3)
-            if 'P' in data.columns:
-                data['P'].interpolate(method='polynomial', order=3, inplace=True)
-            
             data.fillna(0, inplace=True)  # Fill any remaining NaN values with 0
             
-            # Calculate dimensionless coefficients from interpolated physical quantities
+            # Physical constants and unit conversions
             # Using SI units: V (m/s), rpm, D (m), T (N), Q (N·m), P (W)
             rho = 1.225  # Air density in kg/m³ at sea level
             n = rpm / 60.0  # Convert RPM to revolutions per second (Hz)
             D = propeller_diameter  # Already in meters
             
-            # Calculate dimensionless coefficients
+            # CRITICAL: Derive power from torque to maintain fundamental relationship
+            # P = 2π × n × Q (where n is in Hz)
+            # This ensures mathematical consistency throughout the data pipeline
+            data['P'] = 2 * np.pi * n * data['Q']
+            
+            # Calculate dimensionless coefficients from physical quantities
             # J = V / (n * D) - Advance ratio
             data['J'] = np.where(n > 0, data['V'] / (n * D), 0)
             
@@ -100,13 +201,17 @@ def generate_propeller_characteristics(data_folder, verbose=False):
             data['CT'] = np.where(n > 0, data['T'] / (rho * n**2 * D**4), 0)
             
             # CP = P / (rho * n^3 * D^5) - Power coefficient
+            # Now derived from P which is derived from Q, maintaining consistency
             data['CP'] = np.where(n > 0, data['P'] / (rho * n**3 * D**5), 0)
             
-            # CQ = CP / (2 * pi) - Torque coefficient
+            # CQ = CP / (2 * pi) - Torque coefficient (alternative: Q / (rho * n^2 * D^5))
             data['CQ'] = data['CP'] / (2 * np.pi)
             
-            # eta = (CT * J) / CP - Propulsive efficiency
-            data['eta'] = np.where(data['CP'] > 0, (data['CT'] * data['J']) / data['CP'], 0)
+            # eta = (T * V) / P - Propulsive efficiency (for V > 0)
+            # This is the fundamental definition: useful power / shaft power
+            # At V=0 (static thrust), efficiency is zero (no forward motion)
+            # Dimensionless form: eta = (CT * J) / CP should give same result
+            data['eta'] = np.where(data['P'] > 0, (data['T'] * data['V']) / data['P'], 0)
             
             # Append to the list of RPM DataFrames
             rpm_dataframes.append(data)
@@ -143,9 +248,13 @@ def generate_propeller_characteristics(data_folder, verbose=False):
         propeller_data[v] = pd.concat(propeller_data[v], ignore_index=True)
         propeller_data[v] = propeller_data[v].sort_values(by='rpm').reset_index(drop=True)
     
+    # Supplement the zero-truncated windmilling region with negative thrust/torque.
+    if extrapolate:
+        propeller_data = extrapolate_below_zero(propeller_data, propeller_diameter)
+
     if verbose:
         print("✓")
-    
+
     return propeller_data, folder_name
 
 
@@ -217,6 +326,8 @@ Examples:
                         help='List all available propellers and exit')
     parser.add_argument('--verbose', '-v', action='store_true',
                         help='Print detailed progress information')
+    parser.add_argument('--no-extrapolate', dest='extrapolate', action='store_false',
+                        help='Disable negative thrust/torque extrapolation (legacy zero-truncated behaviour)')
     parser.add_argument('--data-dir', default='reformatted_data/performance',
                         help='Directory containing propeller performance data (default: reformatted_data/performance)')
     parser.add_argument('--output-dir', default='reformatted_data/full-characteristics',
@@ -270,7 +381,8 @@ Examples:
             print(f"\rProgress: [{i}/{len(propellers_to_process)}] {progress:.1f}% - {prop_name:<30}", end='', flush=True)
         
         data_folder = os.path.join(args.data_dir, prop_name)
-        propeller_data, folder_name = generate_propeller_characteristics(data_folder, verbose=args.verbose)
+        propeller_data, folder_name = generate_propeller_characteristics(
+            data_folder, verbose=args.verbose, extrapolate=args.extrapolate)
         
         if propeller_data is not None:
             output_file = save_propeller_data(propeller_data, folder_name, args.output_dir)
